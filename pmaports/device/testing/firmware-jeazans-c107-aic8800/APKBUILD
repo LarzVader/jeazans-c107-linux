@@ -1,0 +1,31 @@
+# Reference: <https://postmarketos.org/devicepkg>
+# WLAN-Firmware fuer den AIC8800D80 (Revision U02) des Jeazans C107, aus dem
+# Hersteller-Android des Tablets (/vendor/etc/firmware/aic8800d80, Firmware
+# v6.9.1.1, dieselbe Version, mit der AICSemi den RFC-Treiber getestet hat).
+# Der Treiber (linux-jeazans-c107, Module aic8800_bsp/aic8800_fdrv) laedt sie
+# aus dem Unterordner aic8800/ des Firmware-Suchpfads.
+maintainer="Lars <118484383+LarzVader@users.noreply.github.com>"
+pkgname=firmware-jeazans-c107-aic8800
+pkgver=6.9.1.1
+pkgrel=0
+pkgdesc="AIC8800D80 WLAN firmware for Jeazans C107"
+url="https://www.aicsemi.com"
+arch="aarch64"
+license="custom:proprietary"
+options="!check !strip !archcheck !spdx !tracedeps pmb:cross-native"
+source="
+	fmacfw_8800d80_u02.bin
+	aic_userconfig_8800d80.txt
+"
+
+package() {
+	install -Dm644 "$srcdir"/fmacfw_8800d80_u02.bin \
+		"$pkgdir"/usr/lib/firmware/aic8800/fmacfw_8800d80_u02.bin
+	install -Dm644 "$srcdir"/aic_userconfig_8800d80.txt \
+		"$pkgdir"/usr/lib/firmware/aic8800/aic_userconfig_8800d80.txt
+}
+
+sha512sums="
+b5d9da866f6b5a9e8f70ed80f60c9b01c678ddddebccee7cd557cfaabe3d3ab7623b2923a5280af60edf0a07db554295961e3b4b4a7cf8670333f21fbe9edba1  fmacfw_8800d80_u02.bin
+d63e75d1c2e28a2717b54ba5178dde6ca0393e14e9c5406b93dbbd486971be13405532e4a78741aa388e461189c0bbbbc8526a7b7773ac83fb18c42c1408af49  aic_userconfig_8800d80.txt
+"

@@ -1,0 +1,4 @@
+# CP2102 USB-UART (serielle Konsole des Tablets): Zugriff fuer den angemeldeten Nutzer
+SUBSYSTEM=="tty", ATTRS{idVendor}=="10c4", ATTRS{idProduct}=="ea60", TAG+="uaccess"
+# eMMC des Tablets ueber U-Boot "ums": lesbar fuer den Nutzer, nicht automatisch einbinden
+SUBSYSTEM=="block", ATTRS{idVendor}=="1f3a", TAG+="uaccess", ENV{UDISKS_IGNORE}="1"

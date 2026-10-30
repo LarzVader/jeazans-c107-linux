@@ -1,0 +1,47 @@
+From: Lars <118484383+LarzVader@users.noreply.github.com>
+Subject: [PATCH] wifi: aic: allow setting the MAC address
+
+ndo_set_mac_address is only built without CONFIG_AIC8800_STA_ONLY or with
+an undefined CONFIG_AIC8800_SUPPORT_REALTIME_CHANGE_MAC, and it is not part
+of the regular netdev ops at all. On an AIC8800D80 without a MAC address in
+the efuse (Jeazans C107 tablet) the firmware reports a different random
+address with the vendor prefix 00:25:92:31 on every boot, so DHCP hands out
+a new IPv4 address after each reboot, and user space cannot fix it: setting
+a stable address (NetworkManager cloned-mac-address=stable) fails with
+EOPNOTSUPP and the connection never activates.
+
+Hook the existing callback up unconditionally. It only works while the
+interface is down (eth_mac_addr) and updates wdev.address, which rwnx_open()
+passes to the firmware in MM_ADD_IF_REQ, so the firmware uses the new
+address from the next open on.
+
+---
+--- a/drivers/net/wireless/aic/aic8800_fdrv/rwnx_main.c
++++ b/drivers/net/wireless/aic/aic8800_fdrv/rwnx_main.c
+@@ -1201,7 +1201,6 @@
+  *	needs to be changed. If this interface is not defined, the
+  *	mac address can not be changed.
+  */
+-#if !IS_ENABLED(CONFIG_AIC8800_STA_ONLY) || defined(CONFIG_AIC8800_SUPPORT_REALTIME_CHANGE_MAC)
+ static int rwnx_set_mac_address(struct net_device *dev, void *addr)
+ {
+ 	struct sockaddr *sa = addr;
+@@ -1218,7 +1217,6 @@
+ 
+ 	return ret;
+ }
+-#endif
+ 
+ static const struct net_device_ops rwnx_netdev_ops = {
+ 	.ndo_open = rwnx_open,
+@@ -1228,9 +1226,7 @@
+ #ifndef CONFIG_AIC8800_ONE_TXQ
+ 	.ndo_select_queue = rwnx_select_queue,
+ #endif
+-#ifdef CONFIG_AIC8800_SUPPORT_REALTIME_CHANGE_MAC
+-	.ndo_set_mac_address = rwnx_set_mac_address
+-#endif
++	.ndo_set_mac_address = rwnx_set_mac_address,
+ 	/* unused interface */
+ 	//    .ndo_set_features       = rwnx_set_features,
+ 	//    .ndo_set_rx_mode        = rwnx_set_multicast_list,

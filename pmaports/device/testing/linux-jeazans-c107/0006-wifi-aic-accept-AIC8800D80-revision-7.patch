@@ -1,0 +1,25 @@
+From: Lars <118484383+LarzVader@users.noreply.github.com>
+Subject: [PATCH] wifi: aic: accept AIC8800D80 revision 7 with the U02 firmware
+
+The RFC v3 BSP only accepts chip_rev 3 (U02). The AIC8800D80 in the Jeazans
+C107 tablet reports revision 7 (subrev 0x82); the vendor driver
+(aic-bsp-compatible 20231222) loads the U02 firmware set for it, and the
+chip works with that under Android. Accept revision 7 the same way.
+
+---
+--- a/drivers/net/wireless/aic/aic8800_bsp/aic_chip_8800d80.c
++++ b/drivers/net/wireless/aic/aic8800_bsp/aic_chip_8800d80.c
+@@ -64,7 +64,12 @@
+ 
+ 	aicbsp_info->chip_rev = (u8)((rd_mem_addr_cfm.memdata >> 16) & 0x3F);
+ 	is_chip_id_h = (u8)(((rd_mem_addr_cfm.memdata >> 16) & 0xC0) == 0xC0);
+-	if (is_chip_id_h || aicbsp_info->chip_rev != CHIP_REV_U02) {
++	/*
++	 * Revision 7 (U03) runs the U02 firmware as well, like the vendor driver
++	 * (aic-bsp-compatible 20231222) does on the Jeazans C107 tablet.
++	 */
++	if (is_chip_id_h || (aicbsp_info->chip_rev != CHIP_REV_U02 &&
++			      aicbsp_info->chip_rev != CHIP_REV_U03)) {
+ 		pr_err("aicbsp: AIC8800D80 U02 is required (revision %u)\n",
+ 		       aicbsp_info->chip_rev);
+ 		return -ENODEV;

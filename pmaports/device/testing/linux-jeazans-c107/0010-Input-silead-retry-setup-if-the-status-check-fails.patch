@@ -1,0 +1,70 @@
+From: Lars <118484383+LarzVader@users.noreply.github.com>
+Subject: [PATCH] Input: silead - power cycle and retry setup if the status check fails
+
+On the Jeazans C107 tablet (Allwinner A523, GSL3676 behind a 3.3 V supply
+that stays on across a warm reboot) the first start after loading the
+firmware leaves the status register at 0 after a warm reboot, so probe
+fails with "Initialization error, status: 0x0". Toggling the power GPIO
+and loading the firmware again does not help, but binding the driver
+again after the failed probe does, because the failed probe released the
+supply. So on a bad status turn the supply off for 200 ms, then start
+over (power GPIO, init, firmware, startup); give up after 3 tries.
+
+---
+--- a/drivers/input/touchscreen/silead.c
++++ b/drivers/input/touchscreen/silead.c
+@@ -55,6 +55,8 @@
+ #define SILEAD_CMD_SLEEP_MAX	20000
+ #define SILEAD_POWER_SLEEP	20
+ #define SILEAD_STARTUP_SLEEP	30
++#define SILEAD_SETUP_TRIES	3
++#define SILEAD_SUPPLY_OFF_SLEEP	200
+ 
+ #define SILEAD_MAX_FINGERS	10
+ 
+@@ -499,7 +501,8 @@
+ 
+ static int silead_ts_setup(struct i2c_client *client)
+ {
+-	int error;
++	struct silead_ts_data *data = i2c_get_clientdata(client);
++	int error, tries = 0;
+ 	u32 status;
+ 
+ 	/*
+@@ -537,6 +540,7 @@
+ 		pm_runtime_disable(&client->dev);
+ 	}
+ 
++retry:
+ 	silead_ts_set_power(client, SILEAD_POWER_OFF);
+ 	silead_ts_set_power(client, SILEAD_POWER_ON);
+ 
+@@ -564,6 +568,27 @@
+ 
+ 	status = silead_ts_get_status(client);
+ 	if (status != SILEAD_STATUS_OK) {
++		/*
++		 * After a warm reboot the supply can still be on from the last
++		 * boot. The first start after loading the firmware then reports
++		 * status 0 (seen on a GSL3676) and toggling the power GPIO does
++		 * not help, but a fresh power-up does (as when binding again
++		 * after a failed probe). Cut the supply and start over.
++		 */
++		if (++tries < SILEAD_SETUP_TRIES) {
++			dev_warn(&client->dev,
++				 "Initialization error, status: 0x%X, power cycling\n",
++				 status);
++			silead_ts_set_power(client, SILEAD_POWER_OFF);
++			regulator_bulk_disable(ARRAY_SIZE(data->regulators),
++					       data->regulators);
++			msleep(SILEAD_SUPPLY_OFF_SLEEP);
++			error = regulator_bulk_enable(ARRAY_SIZE(data->regulators),
++						      data->regulators);
++			if (error)
++				return error;
++			goto retry;
++		}
+ 		dev_err(&client->dev,
+ 			"Initialization error, status: 0x%X\n", status);
+ 		return -ENODEV;

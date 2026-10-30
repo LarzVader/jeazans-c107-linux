@@ -1,0 +1,13 @@
+diff --git a/arch/arm/mach-sunxi/Kconfig b/arch/arm/mach-sunxi/Kconfig
+index b0c5d3cd..eb47d7ef 100644
+--- a/arch/arm/mach-sunxi/Kconfig
++++ b/arch/arm/mach-sunxi/Kconfig
+@@ -265,7 +265,7 @@ config SUNXI_RVBAR_ALTERNATIVE
+ 	  irrelevant there, and we can use the same code.
+ 
+ config SUNXI_BL31_BASE
+-	hex
++	hex "BL31 (TF-A) load address, 0 = boot U-Boot directly"
+ 	default 0x00044000 if MACH_SUN50I || MACH_SUN50I_H5
+ 	default 0x40000000 if MACH_SUN50I_H616
+ 	default 0x00104000 if SUN50I_GEN_H6

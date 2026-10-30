@@ -1,0 +1,39 @@
+From: Lars <118484383+LarzVader@users.noreply.github.com>
+Subject: [PATCH] wifi: aic: keep change_station in the station-only build
+
+With CONFIG_AIC8800_STA_ONLY the cfg80211 change_station callback is left
+out together with add/del_station. It is needed in station mode as well:
+after the 4-way handshake wpa_supplicant sets NL80211_STA_FLAG_AUTHORIZED
+on the AP station entry, and the callback forwards that to the firmware as
+ME_SET_CONTROL_PORT_REQ. Without it the controlled port stays closed, so
+only EAPOL frames pass: association and key negotiation succeed, but DHCP,
+ARP replies and every other unicast data frame are dropped (seen on the
+Jeazans C107 tablet with an AIC8800D80 on both 2.4 and 5 GHz).
+
+---
+--- a/drivers/net/wireless/aic/aic8800_fdrv/rwnx_main.c
++++ b/drivers/net/wireless/aic/aic8800_fdrv/rwnx_main.c
+@@ -2808,7 +2808,7 @@
+  *	them, also against the existing state! Drivers must call
+  *	cfg80211_check_station_change() to validate the information.
+  */
+-static int __maybe_unused rwnx_cfg80211_change_station(struct wiphy *wiphy,
++static int rwnx_cfg80211_change_station(struct wiphy *wiphy,
+ 					struct wireless_dev *wdev,
+ 					const u8 *mac,
+ 					struct station_parameters *params)
+@@ -4669,8 +4669,13 @@
+ #if !IS_ENABLED(CONFIG_AIC8800_STA_ONLY)
+ 	.add_station = rwnx_cfg80211_add_station,
+ 	.del_station = rwnx_cfg80211_del_station_compat,
+-	.change_station = rwnx_cfg80211_change_station,
+ #endif
++	/*
++	 * Needed in station mode too: after the 4-way handshake the supplicant
++	 * sets NL80211_STA_FLAG_AUTHORIZED on the AP's station entry, which
++	 * opens the firmware's controlled port. Without it only EAPOL passes.
++	 */
++	.change_station = rwnx_cfg80211_change_station,
+ 	.mgmt_tx = rwnx_cfg80211_mgmt_tx,
+ #if !IS_ENABLED(CONFIG_AIC8800_STA_ONLY)
+ 	.start_ap = rwnx_cfg80211_start_ap,

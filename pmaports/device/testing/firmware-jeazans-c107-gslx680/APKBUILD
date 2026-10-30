@@ -1,0 +1,30 @@
+# Reference: <https://postmarketos.org/devicepkg>
+# Firmware fuer den Touch-Controller (Silead GSL3676) des Jeazans C107, aus dem
+# Hersteller-Android des Tablets (/vendor/etc/firmware/gsl_firmware). Der Chip
+# hat keinen Flash, der Treiber silead (linux-jeazans-c107) laedt die Firmware
+# bei jedem Einschalten aus silead/gsl3676-jeazans-c107.fw.
+maintainer="Lars <118484383+LarzVader@users.noreply.github.com>"
+pkgname=firmware-jeazans-c107-gslx680
+pkgver=1
+pkgrel=0
+pkgdesc="Silead GSL3676 touchscreen firmware for Jeazans C107"
+url="https://postmarketos.org"
+arch="aarch64"
+license="custom:proprietary"
+options="!check !strip !archcheck !spdx !tracedeps pmb:cross-native"
+source="gslX680_3676_1280x800_yhk.bin"
+
+package() {
+	# Herstellerformat: u32 Anzahl, dann so viele Paare (u32 Register, u32 Wert),
+	# danach Parameter fuer Androids Auswertungsalgorithmus. silead erwartet nur
+	# die Paare.
+	_fw="$srcdir"/gslX680_3676_1280x800_yhk.bin
+	_n=$(od -An -tu4 -N4 "$_fw" | tr -d ' ')
+	install -d "$pkgdir"/usr/lib/firmware/silead
+	tail -c +5 "$_fw" | head -c $((_n * 8)) \
+		> "$pkgdir"/usr/lib/firmware/silead/gsl3676-jeazans-c107.fw
+}
+
+sha512sums="
+e1138e99236fffdcca8a80a7781f3b7e6eec4045ab155b8e0a116c49b5191911a0ceeb0bad88ae0085114a7909f1435f4135180bcb50f48fc746a7e13110d1a5  gslX680_3676_1280x800_yhk.bin
+"

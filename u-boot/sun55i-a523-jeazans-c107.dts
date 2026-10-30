@@ -1,0 +1,68 @@
+// SPDX-License-Identifier: (GPL-2.0-only OR MIT)
+/*
+ * Jeazans C107 (BigdroidOS-Tablet, Allwinner A523) – minimaler Geraetebaum
+ * fuer U-Boot im FEL-Betrieb: Konsole ueber den microSD-Slot (UART0 auf
+ * PF2/PF4), eMMC an MMC2, USB-OTG als Geraet (fuer "ums").
+ * Die PMIC (AXP2202/AXP717) wird bewusst nicht beschrieben, damit U-Boot
+ * keine Spannungen veraendert.
+ */
+
+/dts-v1/;
+
+#include "sun55i-a523.dtsi"
+
+#include <dt-bindings/gpio/gpio.h>
+
+/ {
+	model = "Jeazans C107 Tablet";
+	compatible = "jeazans,c107", "allwinner,sun55i-a523";
+
+	aliases {
+		mmc0 = &mmc2;
+		serial0 = &uart0;
+	};
+
+	chosen {
+		stdout-path = "serial0:115200n8";
+	};
+
+	reg_vcc3v3: vcc3v3 {
+		/* Platzhalter: die echte Versorgung kommt aus der PMIC */
+		compatible = "regulator-fixed";
+		regulator-name = "vcc-3v3";
+		regulator-min-microvolt = <3300000>;
+		regulator-max-microvolt = <3300000>;
+		regulator-always-on;
+	};
+};
+
+&pio {
+	uart0_pf_pins: uart0-pf-pins {
+		pins = "PF2", "PF4";
+		allwinner,pinmux = <3>;
+		function = "uart0";
+	};
+};
+
+&uart0 {
+	pinctrl-names = "default";
+	pinctrl-0 = <&uart0_pf_pins>;
+	status = "okay";
+};
+
+&mmc2 {
+	vmmc-supply = <&reg_vcc3v3>;
+	bus-width = <8>;
+	non-removable;
+	cap-mmc-hw-reset;
+	status = "okay";
+};
+
+&usb_otg {
+	dr_mode = "peripheral";
+	status = "okay";
+};
+
+&usbphy {
+	status = "okay";
+};

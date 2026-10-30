@@ -1,0 +1,29 @@
+From: Lars <118484383+LarzVader@users.noreply.github.com>
+Subject: [PATCH] wifi: aic: load the BSP firmware without a device
+
+The BSP downloads the firmware through SDIO function 1 before the WLAN
+driver binds that function. request_firmware() with that device adds a
+firmware-cache devres entry (fw_add_devm_name) to the still unbound
+function, so the WLAN probe fails with -EBUSY ("Resources present before
+probing") and no interface appears. The data is copied into a private
+buffer and released right away, so request it without a device.
+
+---
+--- a/drivers/net/wireless/aic/aic8800_bsp/aic_bsp_driver.c
++++ b/drivers/net/wireless/aic/aic8800_bsp/aic_bsp_driver.c
+@@ -491,7 +491,14 @@
+ 	if (!fw_name)
+ 		return -ENOMEM;
+ 
+-	ret = request_firmware(fw, fw_name, dev);
++	/*
++	 * dev is SDIO function 1, which the BSP drives without being bound to
++	 * it; the WLAN driver binds it afterwards. request_firmware() would add
++	 * a firmware-cache devres entry to it, and that probe then fails with
++	 * -EBUSY ("Resources present before probing"). The data is copied and
++	 * released right away, so load it without a device.
++	 */
++	ret = request_firmware(fw, fw_name, NULL);
+ 	kfree(fw_name);
+ 
+ 	return ret;

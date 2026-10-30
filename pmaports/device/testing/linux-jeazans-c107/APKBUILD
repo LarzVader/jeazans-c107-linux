@@ -1,0 +1,176 @@
+# Reference: <https://postmarketos.org/vendorkernel>
+# Kernel und Konfiguration wie linux-postmarketos-stable (7.2.11), dazu
+# der Geraetebaum des Tablets und die Akku-/Ladetreiber der AXP-PMIC.
+# Gekuerzt (r1): nur die Allwinner-Plattform und ohne KALLSYMS_ALL, damit
+# Kernel-Image und pmOS-Initramfs zusammen in boot_b (64 MiB) passen; der
+# Hersteller-bootm nimmt nur unkomprimierte Kernel. BTF bleibt (kconfig check).
+# ATH12K_AHB ist aus: ohne ARCH_QCOM zoege es qcom_scm und qcom_tzmem als
+# Module nach, die sich gegenseitig brauchen (depmod-Zyklus).
+# WLAN (r2): AIC8800D80-Treiber aus der RFC-Serie v3 von AICSemi fuer
+# wireless-next (lore.kernel.org, cover.1787903339.git.yanli.yang@bedmex.com),
+# Patch 0005 passt cfg80211_probe_status an 7.2 an, 0006 laesst den D80 mit
+# Revision 7 zu (wie der Herstellertreiber, mit der U02-Firmware), 0007 laedt
+# die BSP-Firmware ohne Geraet (sonst devres an SDIO-Funktion 1, -EBUSY), 0008
+# verhindert den Oops bei einer Scan-Bestaetigung nach Abbruch, 0009 traegt
+# change_station wieder ein (sonst bleibt der 802.1X-Kontrollport zu). Geraetebaum
+# (r3) mit PMIC-Schienen, SDIO, PL7 (power_en) und PM1 (WL_REG_ON) als
+# Regler. Firmware: firmware-jeazans-c107-aic8800.
+# Display (r7): simpledrm uebernimmt das Bild, das der Hersteller-U-Boot auf
+# dem Panel zeigt (Geraetebaum: simple-framebuffer, reserved-memory, Takte und
+# Power-Domains der Anzeige, gpio-backlight an PH18), Terminus-Schrift 16x32.
+# r8: FRAMEBUFFER_CONSOLE_ROTATION, damit fbcon=rotate:1 die Konsole quer stellt.
+# Touch (r9): Treiber silead als Modul, Geraetebaum mit I2C0 (PH0/PH1), dem
+# GSL3676 an 0x40 (Interrupt PH9, Wake PH10) und CLDO2 als Versorgung.
+# r10: Touch-Achsen im DTS (Rohbereich 1664x896, getauscht und gespiegelt),
+# Patch 0010 wiederholt die Silead-Initialisierung, wenn der Status nach dem
+# Start nicht stimmt (nach warmem Neustart), GPU (Mali-G57) an DCDC2 eingeschaltet.
+# r11: Patch 0010 schaltet vor jedem neuen Versuch auch die Versorgung aus (nur
+# den Power-GPIO umzuschalten reichte nach warmem Neustart nicht).
+# r12: DTS mit Bildspeicher 0xb1f13000 statt 0xb1f0e000 (mit Logos in
+# bootloader_b liegt er dort), INPUT_AXP20X_PEK fuer die Ein/Aus-Taste.
+# r13: Patch 0011 laesst den AIC-Treiber die MAC setzen (sonst wuerfelt die
+# Firmware ohne eFuse-MAC bei jedem Start eine neue, und die IPv4 wechselt).
+# r14: Akku, Ladegeraet und Messwerte der AXP717 im Geraetebaum, Ladeschluss 4,0 V.
+# r15: Lautstaerketasten (KEYBOARD_SUN4I_LRADC) und Lagesensor SC7A20 an I2C1.
+# r16: Patch 0012 meldet den simpledrm-Anschluss als DSI (KWin dreht nur interne
+# Bildschirme automatisch), Einbaulage des Lagesensors im Geraetebaum.
+# r17: Patch 0013 bringt den Uebernahme-Treiber sun55i_takeover (Seitenwechsel,
+# vblank und Helligkeit auf der Anzeigekette, die der Hersteller-U-Boot laufen
+# laesst; Geraetebaum: display@51c1000). Fuer die Tests ist der Kernel-Lockdown
+# vorerst aus (LOCK_DOWN_KERNEL_FORCE_NONE), damit sich der Treiber ohne neuen
+# Kernelbau austauschen laesst. Danach wieder einschalten.
+# r18: Lockdown wieder an (Treiber getestet: Konsole, GPU, Desktop, Helligkeit,
+# Bildschirm aus). Geraetebaum ohne gpio-backlight, PH18 schaltet der Treiber.
+# Das Laden beim Start uebernimmt device-jeazans-c107.
+# r19: Ton. Patches 0014 bis 0016 aus github.com/ut-slayer/orangepi-4a-mainline
+# (dort 0081, 0084, 0111): Treiber sun55i-a523-codec, Portierung des Hersteller-
+# Treibers mit Lautsprecher-Verstaerker, Mikrofonen und Buchsen-Erkennung.
+# Mainline hat fuer den A523-Codec noch nichts, Chen-Yu Tsai arbeitet an einer
+# Erweiterung von sun4i-codec; sobald die drin ist, darauf umsteigen.
+maintainer="Lars <118484383+LarzVader@users.noreply.github.com>"
+pkgname=linux-jeazans-c107
+pkgver=7.2.11
+pkgrel=19
+_kver=${pkgver%.*}
+pkgdesc="Jeazans C107 kernel (mainline)"
+arch="aarch64"
+_carch="arm64"
+_flavor="jeazans-c107"
+url="https://kernel.org"
+license="GPL-2.0-only"
+options="
+	!check
+	!strip
+	!tracedeps
+	pmb:cross-native
+	pmb:kconfigcheck-community
+	pmb:kconfigcheck-nftables
+"
+makedepends="
+	bash
+	bison
+	clang
+	clang-libclang
+	diffutils
+	elfutils-dev
+	findutils
+	flex
+	grep
+	kmod
+	linux-headers
+	lld
+	llvm
+	openssl-dev
+	pahole
+	perl
+	postmarketos-installkernel
+	python3
+	rust
+	rust-bindgen
+	rust-src
+	rustfmt
+	sed
+	zstd
+"
+source="
+	patch-$pkgver.patch.xz::https://cdn.kernel.org/pub/linux/kernel/v${pkgver%%.*}.x/patch-$pkgver.xz
+	linux-$_kver.tar.xz::https://cdn.kernel.org/pub/linux/kernel/v${pkgver%%.*}.x/linux-$_kver.tar.xz
+	config-$_flavor.aarch64
+	sun55i-a523-jeazans-c107.dts
+	0001-wifi-aic-add-SDIO-BSP-and-build-configuration.patch
+	0002-wifi-aic-add-FullMAC-firmware-and-platform-interface.patch
+	0003-wifi-aic-add-FullMAC-WLAN-driver.patch
+	0004-wifi-aic-integrate-AIC8800-driver.patch
+	0005-wifi-aic-build-on-linux-7.2.patch
+	0006-wifi-aic-accept-AIC8800D80-revision-7.patch
+	0007-wifi-aic-load-BSP-firmware-without-device.patch
+	0008-wifi-aic-ignore-scan-confirm-after-abort.patch
+	0009-wifi-aic-keep-change_station-in-station-mode.patch
+	0010-Input-silead-retry-setup-if-the-status-check-fails.patch
+	0011-wifi-aic-allow-setting-the-MAC-address.patch
+	0012-drm-sysfb-simpledrm-report-the-connector-as-DSI.patch
+	0013-drm-sun4i-add-a-display-takeover-driver-for-the-Jeazans-C107.patch
+	0014-ASoC-sunxi-new-driver-for-the-A523-T527-internal-codec.patch
+	0015-ASoC-sunxi-sun55i-a523-codec-quiesce-the-jack-before-the-card.patch
+	0016-ASoC-sunxi-sun55i-a523-codec-cancel-jack-scan-work-on-probe-failure.patch
+"
+builddir="$srcdir/linux-$_kver"
+
+prepare() {
+	default_prepare
+
+	# Geraetebaum des Tablets einhaengen (noch nicht im Hauptkernel)
+	cp "$srcdir"/sun55i-a523-jeazans-c107.dts arch/arm64/boot/dts/allwinner/
+	echo 'dtb-$(CONFIG_ARCH_SUNXI) += sun55i-a523-jeazans-c107.dtb' \
+		>> arch/arm64/boot/dts/allwinner/Makefile
+
+	cp "$srcdir/config-$_flavor.$CARCH" .config
+	# Die Konfiguration ist die von linux-postmarketos-stable plus die
+	# AXP-Akkutreiber, ab r1 ohne fremde Plattformen (ARCH_* ausser SUNXI);
+	# olddefconfig loest die Abhaengigkeiten dazu auf.
+	make ARCH="$_carch" LLVM=1 olddefconfig
+}
+
+build() {
+	unset LDFLAGS
+	make ARCH="$_carch" LLVM=1 \
+		KBUILD_BUILD_VERSION="$((pkgrel + 1 ))-$_flavor"
+}
+
+package() {
+	make modules_install zinstall dtbs_install \
+		ARCH="$_carch" \
+		LLVM=1 \
+		INSTALL_PATH="$pkgdir"/boot \
+		INSTALL_MOD_PATH="$pkgdir"/usr \
+		INSTALL_MOD_STRIP=1 \
+		INSTALL_DTBS_PATH="$pkgdir"/boot/dtbs
+
+	rm -f "$pkgdir"/usr/lib/modules/*/build "$pkgdir"/usr/lib/modules/*/source
+
+	install -Dm644 "$builddir"/include/config/kernel.release \
+		"$pkgdir"/usr/share/kernel/"$_flavor"/kernel.release
+}
+
+sha512sums="
+6da1c08ff2ed0d5780b3184d01607ad15de9270df2b4ee98a9a6fb56725445a5b6491624b0847a58c5277dd525960b850965cc0e14046bf9191ef2bc876a1550  patch-7.2.11.patch.xz
+47e63679363261a864d271277340a6f2d45f544e1a056be4159df081f4f6537d0efa865c4af26611ab33a3079ee65db88ec2f6bc0e5fff43e0c043cde0cd91e1  linux-7.2.tar.xz
+71695521390c604f045b2de50b000f73fba10cb83adf18a623a83e1adad0bc7c9459d165f9d74c7ef148d671a45fc3cad9deddb260026dd3b260aa6274ec999e  config-jeazans-c107.aarch64
+b693f447c663bff42a364e45130611294c70b325efb759004d0febab327ae686b2f3f49e806d1cd91cf4fb348c56a226650c4aae1b3b4f24d52cb2ce049d2c5b  sun55i-a523-jeazans-c107.dts
+df907664903d3243377a2befb5490f89bf592cb1d0a309cf88e65f4355ef07eb98ece7a62c80952666f44bb6c16fb0962a9f39c739fbe7d07ee35303da5255df  0001-wifi-aic-add-SDIO-BSP-and-build-configuration.patch
+31ebed11b46de0ebd61434ec3786862dd475b9f7d9154a2edbe8671e3a5f926b04de139d8ae17d457f4d69d1464840252e81e503ad9115c3de9cd88bb1a7497c  0002-wifi-aic-add-FullMAC-firmware-and-platform-interface.patch
+6c7d4e44803830aa38ff62b9e6b55a062d008366a9a90fa61d26d07c7f4cd45fc5ddd78131c34f7f7d873c71d1a290f6ecb91d1480b2c1675b4abe9dc3a1ad35  0003-wifi-aic-add-FullMAC-WLAN-driver.patch
+a5bad0a419d701ddd1786e36f9e582ea4a780ca6ed16c74bbeb792d34d50052d4ac3e806d80de4e553153bd6864895feaa6e106b620eb4b6201e151b332ec000  0004-wifi-aic-integrate-AIC8800-driver.patch
+e21e2a615e4ff2f0d4f78cb3d9d38d2aaa200a4e672faeab623d9b6f6b333b166f1a4ad1a3c8c58ff3985d6a72c723e1fcca261649cbfc877253a6f89c50cc19  0005-wifi-aic-build-on-linux-7.2.patch
+afdfc77ea5ecfdaf284009498a8fc3254a626a516bc35f1dc85a4e76a20a74150ed12f0f57190bd799f8f7d820fc2ca90d3cd12b7f5d1f82963e1e1e356fada6  0006-wifi-aic-accept-AIC8800D80-revision-7.patch
+d14ce917dae2ed930ae28ff8185dbd39419e27621f7ce1cd998c97ed07147f33259b9b478fbf72599ffcaab89a08b6fcc9b8bcc30dd77331add36d955c07f370  0007-wifi-aic-load-BSP-firmware-without-device.patch
+96644c84bbd4628346f335aa896b7bd8c872a8c6a7bfa61e8a7933056efad401d7eae8117e3b80deeac897bf8c7cc143ed1fb6c38e5defde736a3d68c015335a  0008-wifi-aic-ignore-scan-confirm-after-abort.patch
+f3fd14036546a5e5b8422b73cfe11698748b2b0d7c285770a148032a6e7b875593233147019010b7e883d9e49cd3c97d39f62a14b53df66d46d803b13fdfa91a  0009-wifi-aic-keep-change_station-in-station-mode.patch
+d3c3446d6b34c02d7bcb9832a26cde0c8b84c1e3b807997420daf337a532bbf95d74c6e70cdb0c279abb57c3188c37360e2a687cb482356640fa6f149d428f7a  0010-Input-silead-retry-setup-if-the-status-check-fails.patch
+da0410898cea10a2bd7868e3a237a1ccf3ecf089906f56d127fd43e4d4dcefca9c89cfb46354f009052bbd45183f5e0336eb417ff3524f4f4bce897b9b5b0cb7  0011-wifi-aic-allow-setting-the-MAC-address.patch
+141ee24a74b9f07fad26ab1f1425e1bc60d120d1101c5c6529e190d1ec883d5ae0171f928e89217f85f0b360559a00d27f272bc469e43776df6a395b5eff325b  0012-drm-sysfb-simpledrm-report-the-connector-as-DSI.patch
+d9676a6361da881be44583ec7373410b30af358f2ba7b02b8035a99a7dccd494911a2eb560541c3e6b545fde5efe48717d88522d2411670def4ad42eabf1b264  0013-drm-sun4i-add-a-display-takeover-driver-for-the-Jeazans-C107.patch
+f38b1837dd4edd6c484be685d5fec0164bd14eee9721cb2fee1f6289ebbd14d760f0051eabe94f807c224cf67a94a3b262350ba89a620e7d1aa05b85e506a0d3  0014-ASoC-sunxi-new-driver-for-the-A523-T527-internal-codec.patch
+e5378674de2fa3ecbf932c857c247e10190f8520c5e237a10e503ef341dea0e7806f583596f1dd7f27f4b7b8e7acadc3a1a917655e238f0301a2e1183e00aed9  0015-ASoC-sunxi-sun55i-a523-codec-quiesce-the-jack-before-the-card.patch
+270f2aac4bafad104a322680e5dd65b4f1f6cbe337e3009b3daf816dbbfb217f35b39bc8055802a48e6ff7292cab9d239717eb840cb998cb530c8b452bb58660  0016-ASoC-sunxi-sun55i-a523-codec-cancel-jack-scan-work-on-probe-failure.patch
+"

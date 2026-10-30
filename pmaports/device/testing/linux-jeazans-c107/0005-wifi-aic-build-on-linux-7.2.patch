@@ -1,0 +1,24 @@
+From: Lars <118484383+LarzVader@users.noreply.github.com>
+Subject: [PATCH] wifi: aic: build on Linux 7.2 (cfg80211_probe_status without link_id)
+
+The AIC8800 RFC v3 targets wireless-next, where cfg80211_probe_status()
+gained a link_id argument after the cookie. Linux 7.2 does not have it yet,
+so drop the extra -1 argument for the jeazans-c107 kernel package.
+
+---
+--- a/drivers/net/wireless/aic/aic8800_fdrv/rwnx_main.c
++++ b/drivers/net/wireless/aic/aic8800_fdrv/rwnx_main.c
+@@ -2792,11 +2792,11 @@
+ 	AICWFDBG(LOGDEBUG, "AICWF sta %pM found = %d\n", mac, found);
+ 	if (found)
+ 		cfg80211_probe_status(rwnx_vif->ndev, mac,
+-				      (u64)rwnx_vif->sta_probe.probe_id, -1,
++				      (u64)rwnx_vif->sta_probe.probe_id,
+ 				      true, 0, false, GFP_ATOMIC);
+ 	else
+ 		cfg80211_probe_status(rwnx_vif->ndev, mac,
+-				      (u64)rwnx_vif->sta_probe.probe_id, -1,
++				      (u64)rwnx_vif->sta_probe.probe_id,
+ 				      false, 0, false, GFP_ATOMIC);
+ 	rwnx_vif->sta_probe.probe_id++;
+ }

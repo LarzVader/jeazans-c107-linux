@@ -1,0 +1,24 @@
+From: Lars <118484383+LarzVader@users.noreply.github.com>
+Subject: [PATCH] drm/sysfb: simpledrm: report the connector as DSI
+
+On the Jeazans C107 tablet simpledrm takes over the picture on the built-in
+MIPI-DSI panel that the vendor U-Boot has set up, there is no other display.
+The connector type Unknown makes KWin treat it as an external screen: it only
+rotates outputs automatically if they are internal (LVDS, eDP or DSI), so the
+orientation sensor has no effect.
+
+Local to this tablet, not meant for upstream, where simpledrm cannot know what
+kind of display it is driving.
+
+---
+--- a/drivers/gpu/drm/sysfb/simpledrm.c
++++ b/drivers/gpu/drm/sysfb/simpledrm.c
+@@ -840,7 +840,7 @@
+ 
+ 	connector = &sdev->connector;
+ 	ret = drm_connector_init(dev, connector, &simpledrm_connector_funcs,
+-				 DRM_MODE_CONNECTOR_Unknown);
++				 DRM_MODE_CONNECTOR_DSI);
+ 	if (ret)
+ 		return ERR_PTR(ret);
+ 	drm_connector_helper_add(connector, &simpledrm_connector_helper_funcs);

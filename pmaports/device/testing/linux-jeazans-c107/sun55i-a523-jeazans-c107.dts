@@ -1,0 +1,456 @@
+// SPDX-License-Identifier: (GPL-2.0-only OR MIT)
+/*
+ * Jeazans C107 (BigdroidOS-Tablet, Allwinner A523) – erster Geraetebaum
+ * fuer Linux, gleicher Stand wie der fuer U-Boot: Konsole ueber den
+ * microSD-Slot (UART0 auf PF2/PF4), eMMC an MMC2, USB-OTG als Geraet
+ * (fuer USB-Netzwerk und SSH), WLAN (AIC8800D80 an SDIO/MMC1).
+ * Von den PMICs (AXP2202 = AXP717 an 0x34, AXP1530 = AXP313A an 0x36, beide
+ * an r_i2c0) sind nur die WLAN-Schienen beschrieben; Regler ohne Eintrag
+ * (CPU, DRAM usw.) laesst Linux unangetastet. Werte laut Hersteller-Geraetebaum.
+ * Display als uebernommenes Bild des Hersteller-U-Boot (simple-framebuffer, dann
+ * der Treiber sun55i_takeover mit Helligkeit und Hintergrundlicht). Touch: Silead
+ * GSL3676 an I2C0 (PH0/PH1).
+ * GPU (Mali-G57, Panfrost) an DCDC2 der AXP717 wie bei den Referenzboards.
+ * Akku, Ladegeraet und Messwerte aus der AXP717 (Treiber axp20x_battery,
+ * axp20x_usb_power, axp20x_adc). Lagesensor SC7A20 an I2C1, Lautstaerketasten
+ * an der LRADC. Ton ueber den eingebauten Codec.
+ * Noch nicht beschrieben: Bluetooth.
+ */
+
+/dts-v1/;
+
+#include "sun55i-a523.dtsi"
+
+#include <dt-bindings/gpio/gpio.h>
+#include <dt-bindings/input/linux-event-codes.h>
+
+/ {
+	model = "Jeazans C107 Tablet";
+	compatible = "jeazans,c107", "allwinner,sun55i-a523";
+
+	aliases {
+		mmc0 = &mmc2;
+		serial0 = &uart0;
+	};
+
+	/*
+	 * Laut Hersteller-Geraetebaum 4990 mAh, Laden mit 800 mA (die AXP717 stellt
+	 * in 64-mA-Schritten) bis 4,35 V. Das Tablet laeuft dauerhaft am Netzteil,
+	 * darum steht hier als Ladeschluss bewusst der kleinste Wert der AXP717:
+	 * 4,0 V als Sicherung. Der Dienst jeazans-c107-akku-halten aus dem
+	 * Geraetepaket stoppt das Laden schon bei rund 3,8 V Ruhespannung.
+	 */
+	battery: battery {
+		compatible = "simple-battery";
+		charge-full-design-microamp-hours = <4990000>;
+		constant-charge-current-max-microamp = <768000>;
+		voltage-max-design-microvolt = <4000000>;
+	};
+
+	chosen {
+		stdout-path = "serial0:115200n8";
+
+		/*
+		 * Der Hersteller-U-Boot schaltet das Panel ein (JD9365DA, 800x1280,
+		 * MIPI-DSI mit 4 Lanes an TCON-LCD1/DSI1, 68 MHz) und zeigt das Logo.
+		 * Fuer die Display-Engine des A523 hat Linux 7.2 noch keinen Treiber,
+		 * simpledrm uebernimmt das Bild. Dafuer muessen Takte und
+		 * Power-Domains der Anzeige an bleiben (Liste grosszuegig, mit IOMMU,
+		 * durch den die DE liest, und PWM0 fuer die Helligkeit).
+		 */
+		framebuffer {
+			compatible = "simple-framebuffer";
+			memory-region = <&fb_mem>;
+			width = <800>;
+			height = <1280>;
+			stride = <3200>;
+			format = "a8r8g8b8";
+			clocks = <&ccu CLK_BUS_DE>, <&ccu CLK_DE>,
+				 <&ccu CLK_BUS_DISPLAY0_TOP>, <&ccu CLK_BUS_DISPLAY1_TOP>,
+				 <&ccu CLK_BUS_TCON_LCD1>, <&ccu CLK_TCON_LCD1>,
+				 <&ccu CLK_BUS_MIPI_DSI1>, <&ccu CLK_MIPI_DSI1>,
+				 <&ccu CLK_COMBOPHY_DSI1>,
+				 <&ccu CLK_BUS_IOMMU>, <&ccu CLK_IOMMU>,
+				 <&ccu CLK_BUS_PWM0>;
+			power-domains = <&pck600 PD_DE>, <&pck600 PD_VO0>;
+		};
+	};
+
+	reserved-memory {
+		#address-cells = <2>;
+		#size-cells = <2>;
+		ranges;
+
+		/*
+		 * Bildspeicher des Hersteller-U-Boot (in seiner Kernel-Zeile:
+		 * disp_reserve=4096000,0xb1f13000; "disp" am Prompt: addr[b1f13000]),
+		 * 32 Bit pro Pixel. Die Display-Engine liest ihn weiter aus. Die
+		 * Adresse haengt am Heap des U-Boot: mit Logos in bootloader_<slot>
+		 * 0xb1f13000 (wie unter Android), ohne Logos war es 0xb1f0e000.
+		 */
+		fb_mem: framebuffer@b1f13000 {
+			reg = <0x0 0xb1f13000 0x0 0x3e8000>;
+			no-map;
+		};
+	};
+
+	reg_vcc3v3: vcc3v3 {
+		/* Platzhalter: die echte Versorgung kommt aus der PMIC */
+		compatible = "regulator-fixed";
+		regulator-name = "vcc-3v3";
+		regulator-min-microvolt = <3300000>;
+		regulator-max-microvolt = <3300000>;
+		regulator-always-on;
+	};
+
+	/*
+	 * Referenz der LRADC: Hersteller "keyboard_1350mv", also 3/4 von 1,8 V.
+	 * Die Schiene nennt der Hersteller-DT nicht, darum auch ein Platzhalter.
+	 */
+	reg_vref_lradc: vref-lradc {
+		compatible = "regulator-fixed";
+		regulator-name = "vref-lradc";
+		regulator-min-microvolt = <1800000>;
+		regulator-max-microvolt = <1800000>;
+		regulator-always-on;
+	};
+
+	/*
+	 * PL7 = power_en der Funkmodul-Versorgung: das Hersteller-rfkill setzt
+	 * es beim Start dauerhaft auf high ("power_en gpio=359 assert=1"); ohne
+	 * meldet sich der AIC8800 nicht am SDIO-Bus (getestet 29.10.).
+	 */
+	reg_wifi_pwr: regulator-wifi-pwr {
+		compatible = "regulator-fixed";
+		regulator-name = "vcc-wifi-pwr";
+		gpio = <&r_pio 0 7 GPIO_ACTIVE_HIGH>; /* PL7 */
+		enable-active-high;
+		regulator-always-on;
+		regulator-boot-on;
+	};
+
+	/*
+	 * WL_REG_ON (PM1) als geschalteter Regler hinter DLDO1 statt
+	 * mmc-pwrseq-simple: pwrseq-simple reicht eine einzelne reset-gpios-
+	 * Leitung an den Reset-Kern weiter (CONFIG_RESET_GPIO), und der kann in
+	 * 7.2 nur GPIO-Controller mit 2 Zellen (Allwinner hat 3) -> -ENOENT.
+	 */
+	reg_wifi_en: regulator-wifi-en {
+		compatible = "regulator-fixed";
+		regulator-name = "vcc-wifi-en";
+		regulator-min-microvolt = <3300000>;
+		regulator-max-microvolt = <3300000>;
+		vin-supply = <&reg_dldo1_1530>;
+		gpio = <&r_pio 1 1 GPIO_ACTIVE_HIGH>; /* PM1 = WL_REG_ON */
+		enable-active-high;
+		startup-delay-us = <200000>;
+	};
+};
+
+&{/soc} {
+	/*
+	 * Treiber sun55i_takeover: die Anzeigekette laeuft weiter, wie der
+	 * Hersteller-U-Boot sie eingerichtet hat, der Treiber setzt nur Bildadresse,
+	 * Bild-Interrupt und Helligkeit. Darum nur die Register, die er anfasst: die
+	 * aktive UI-Ebene (phy6) der Display-Engine, TCON-LCD1 (Interrupt laut
+	 * Hersteller-DT) und PWM0 Kanal 0 (auf PD23, 50 kHz). Takte und Power-Domains
+	 * wie beim simple-framebuffer, der das Bild bis dahin haelt. PH18 ist
+	 * lcd_bl_en des Panels.
+	 */
+	display@51c1000 {
+		compatible = "jeazans,c107-display-takeover";
+		reg = <0x051c1000 0x100>, <0x05502000 0x1000>, <0x02000d00 0x10>;
+		reg-names = "layer", "tcon", "pwm";
+		interrupts = <GIC_SPI 92 IRQ_TYPE_LEVEL_HIGH>;
+		clocks = <&ccu CLK_BUS_DE>, <&ccu CLK_DE>,
+			 <&ccu CLK_BUS_DISPLAY0_TOP>, <&ccu CLK_BUS_DISPLAY1_TOP>,
+			 <&ccu CLK_BUS_TCON_LCD1>, <&ccu CLK_TCON_LCD1>,
+			 <&ccu CLK_BUS_MIPI_DSI1>, <&ccu CLK_MIPI_DSI1>,
+			 <&ccu CLK_COMBOPHY_DSI1>,
+			 <&ccu CLK_BUS_IOMMU>, <&ccu CLK_IOMMU>,
+			 <&ccu CLK_BUS_PWM0>;
+		power-domains = <&pck600 PD_DE>, <&pck600 PD_VO0>;
+		backlight-enable-gpios = <&pio 7 18 GPIO_ACTIVE_HIGH>; /* PH18 */
+	};
+
+	/*
+	 * Eingebauter Codec, fehlt noch in der A523-dtsi (Treiber sun55i-a523-codec,
+	 * Patch 0014). Werte aus dem Hersteller-DT: Die Lautsprecher haengen an
+	 * LINEOUT hinter einem Verstaerker an PH6 (aktiv high), die Kopfhoerer an
+	 * HPOUT, die Buchse meldet sich mit jack-det-level 0.
+	 */
+	codec: codec@7110000 {
+		compatible = "allwinner,sun55i-a523-codec";
+		reg = <0x07110000 0x350>;
+		interrupts = <GIC_SPI 190 IRQ_TYPE_LEVEL_HIGH>;
+		clocks = <&mcu_ccu CLK_BUS_MCU_AUDIO_CODEC>,
+			 <&mcu_ccu CLK_MCU_AUDIO_CODEC_DAC>,
+			 <&mcu_ccu CLK_MCU_AUDIO_CODEC_ADC>;
+		clock-names = "bus", "dac", "adc";
+		resets = <&mcu_ccu RST_BUS_MCU_AUDIO_CODEC>;
+		dmas = <&mcu_dma 7>, <&mcu_dma 7>;
+		dma-names = "tx", "rx";
+		avcc-supply = <&reg_aldo4>;
+		vdd-supply = <&reg_cldo3>;
+		cpvin-supply = <&reg_cldo1>;
+		allwinner,pa-gpios = <&pio 7 6 GPIO_ACTIVE_HIGH>; /* PH6 */
+		allwinner,jack-det-level-low;
+	};
+
+	/*
+	 * Lautstaerketasten; die LRADC fehlt noch in der A523-dtsi. Register wie
+	 * bei R329/H616, Adresse, Interrupt und Nennspannungen (646 und 1080 mV)
+	 * aus dem Hersteller-DT.
+	 */
+	lradc: lradc@2009800 {
+		compatible = "allwinner,sun55i-a523-lradc",
+			     "allwinner,sun50i-r329-lradc";
+		reg = <0x2009800 0x100>;
+		interrupts = <GIC_SPI 66 IRQ_TYPE_LEVEL_HIGH>;
+		clocks = <&ccu CLK_BUS_LRADC>;
+		resets = <&ccu RST_BUS_LRADC>;
+		vref-supply = <&reg_vref_lradc>;
+
+		button-646 {
+			label = "Volume Up";
+			linux,code = <KEY_VOLUMEUP>;
+			channel = <0>;
+			voltage = <646000>;
+		};
+
+		button-1080 {
+			label = "Volume Down";
+			linux,code = <KEY_VOLUMEDOWN>;
+			channel = <0>;
+			voltage = <1080000>;
+		};
+	};
+};
+
+&mmc1 {
+	/* AIC8800D80, Treiber ohne DT-Bindung (erkennt den Chip an der SDIO-ID) */
+	bus-width = <4>;
+	non-removable;
+	vmmc-supply = <&reg_wifi_en>;
+	vqmmc-supply = <&reg_bldo1>;
+	status = "okay";
+};
+
+&gpu {
+	mali-supply = <&reg_dcdc2>;
+	status = "okay";
+};
+
+&i2c0 {
+	pinctrl-names = "default";
+	pinctrl-0 = <&i2c0_ph_pins>;
+	clock-frequency = <400000>;
+	status = "okay";
+
+	/*
+	 * Touch-Controller: Silead GSL3676 (Hersteller-DT: gslX680, Konfiguration
+	 * "gslX680_3676_1280x800_yhk"); der Treiber silead unterscheidet die
+	 * GSL-Typen nicht. Der Chip hat keinen Flash, die Firmware kommt aus
+	 * firmware-jeazans-c107-gslx680 (aus der Android-Sicherung umgesetzt).
+	 * Ohne Androids Auswertungsalgorithmus kommen Rohwerte im Querformat:
+	 * X 0..1663 von links nach rechts, Y 0..895 von oben nach unten
+	 * (26 x 14 Sensorleitungen x 64, gemessen am 29.10.). Tauschen und
+	 * Spiegeln bringt sie in die Ausrichtung des Panels (hochkant 800x1280,
+	 * wie simpledrm), die Oberflaeche dreht dann beides zusammen.
+	 */
+	touchscreen@40 {
+		compatible = "silead,gsl3675";
+		reg = <0x40>;
+		interrupt-parent = <&pio>;
+		interrupts = <7 9 IRQ_TYPE_EDGE_FALLING>;	/* PH9 */
+		power-gpios = <&pio 7 10 GPIO_ACTIVE_HIGH>;	/* PH10 (wakeup) */
+		vddio-supply = <&reg_cldo2>;
+		firmware-name = "gsl3676-jeazans-c107.fw";
+		touchscreen-size-x = <1664>;
+		touchscreen-size-y = <896>;
+		touchscreen-inverted-y;
+		touchscreen-swapped-x-y;
+	};
+};
+
+&i2c1 {
+	pinctrl-names = "default";
+	pinctrl-0 = <&i2c1_ph_pins>;
+	clock-frequency = <400000>;
+	status = "okay";
+
+	/*
+	 * Lagesensor SC7A20. Der Hersteller-DT nennt INT1 an PH11, sein Treiber
+	 * fragt den Chip aber nur ab. Ohne interrupts gibt es hier keinen Trigger,
+	 * iio-sensor-proxy liest dann ebenfalls per Abfrage.
+	 */
+	accelerometer@19 {
+		compatible = "silan,sc7a20";
+		reg = <0x19>;
+		vdd-supply = <&reg_vcc3v3>;
+		vddio-supply = <&reg_vcc3v3>;
+		/*
+		 * Gemessen am 30.10.: Querlage (rechte Panelkante oben) x = +1 g,
+		 * Panel aufrecht y = -1 g, flach mit Bildschirm nach oben z = -1 g.
+		 * iio-sensor-proxy will fuer "normal" y < 0 und fuer "right-up" x < 0.
+		 */
+		mount-matrix = "-1", "0", "0",
+			       "0", "1", "0",
+			       "0", "0", "-1";
+	};
+};
+
+&pio {
+	vcc-pg-supply = <&reg_bldo1>;	/* PG-Bank (SDIO) mit 1,8 V wie beim Hersteller */
+
+	/* Mux-Werte aus pinctrl-sun55iw3.ko des Herstellers (PH0-PH3: 2 = twi0, twi1) */
+	i2c0_ph_pins: i2c0-ph-pins {
+		pins = "PH0", "PH1";
+		allwinner,pinmux = <2>;
+		function = "i2c0";
+		bias-pull-up;
+	};
+
+	i2c1_ph_pins: i2c1-ph-pins {
+		pins = "PH2", "PH3";
+		allwinner,pinmux = <2>;
+		function = "i2c1";
+		bias-pull-up;
+	};
+
+	uart0_pf_pins: uart0-pf-pins {
+		pins = "PF2", "PF4";
+		allwinner,pinmux = <3>;
+		function = "uart0";
+	};
+};
+
+&r_i2c0 {
+	status = "okay";
+
+	/* Haupt-PMIC; Interrupt ueber den NMI-Eingang wie beim Hersteller */
+	axp2202: pmic@34 {
+		compatible = "x-powers,axp717";
+		reg = <0x34>;
+		interrupt-controller;
+		#interrupt-cells = <1>;
+		interrupts-extended = <&nmi_intc 0 IRQ_TYPE_LEVEL_LOW>;
+
+		axp717_adc: adc {
+			compatible = "x-powers,axp717-adc";
+			#io-channel-cells = <1>;
+		};
+
+		/* Fuehler am TS-Eingang ist vorhanden, die AXP717 wertet ihn selbst aus */
+		battery-power {
+			compatible = "x-powers,axp717-battery-power-supply";
+			monitored-battery = <&battery>;
+		};
+
+		/* 2 A wie vom Hersteller-U-Boot eingestellt (Android: 1,9 A am Netzteil) */
+		usb-power {
+			compatible = "x-powers,axp717-usb-power-supply";
+			input-current-limit-microamp = <2000000>;
+		};
+
+		regulators {
+			reg_dcdc2: dcdc2 {
+				/*
+				 * GPU und Systemteile; beim Hersteller boot-on und
+				 * always-on, die GPU lief dort mit 920 mV (bis 696 MHz).
+				 * Wie bei Orange Pi 4A und Avaota A1 fest auf 920 mV.
+				 */
+				regulator-always-on;
+				regulator-min-microvolt = <920000>;
+				regulator-max-microvolt = <920000>;
+				regulator-name = "vdd-gpu-sys";
+			};
+
+			reg_bldo1: bldo1 {
+				regulator-min-microvolt = <1800000>;
+				regulator-max-microvolt = <1800000>;
+				regulator-name = "vcc-pg-wifi";
+			};
+
+			reg_bldo2: bldo2 {
+				/* beim Hersteller boot-on und always-on */
+				regulator-always-on;
+				regulator-min-microvolt = <1800000>;
+				regulator-max-microvolt = <1800000>;
+				regulator-name = "vcc-pm";
+			};
+
+			reg_cldo2: cldo2 {
+				/* nur fuer den Touch-Controller (ctp-supply, 3,3 V) */
+				regulator-min-microvolt = <3300000>;
+				regulator-max-microvolt = <3300000>;
+				regulator-name = "vcc-ctp";
+			};
+
+			/*
+			 * Versorgung des Codecs, Spannungen laut Hersteller-DT. Fest an wie
+			 * bisher: Der U-Boot schaltet sie ein, CLDO1 und CLDO3 sind geteilt.
+			 */
+			reg_aldo4: aldo4 {
+				regulator-always-on;
+				regulator-min-microvolt = <1800000>;
+				regulator-max-microvolt = <1800000>;
+				regulator-name = "vcc-audio-avcc";
+			};
+
+			reg_cldo1: cldo1 {
+				regulator-always-on;
+				regulator-min-microvolt = <1800000>;
+				regulator-max-microvolt = <1800000>;
+				regulator-name = "vcc-audio-cpvin";
+			};
+
+			reg_cldo3: cldo3 {
+				regulator-always-on;
+				regulator-min-microvolt = <3300000>;
+				regulator-max-microvolt = <3300000>;
+				regulator-name = "vcc-audio-vdd";
+			};
+		};
+	};
+
+	/*
+	 * Zusatz-PMIC ohne Interrupt-Leitung (nur Regler). Versorgt auch die
+	 * grossen CPU-Kerne (DCDC1), deshalb hier nur DLDO1 beschreiben.
+	 */
+	axp1530: pmic@36 {
+		compatible = "x-powers,axp313a";
+		reg = <0x36>;
+
+		regulators {
+			reg_dldo1_1530: dldo1 {
+				regulator-min-microvolt = <3300000>;
+				regulator-max-microvolt = <3300000>;
+				regulator-name = "vcc-wifi";
+			};
+		};
+	};
+};
+
+&uart0 {
+	pinctrl-names = "default";
+	pinctrl-0 = <&uart0_pf_pins>;
+	status = "okay";
+};
+
+&mmc2 {
+	vmmc-supply = <&reg_vcc3v3>;
+	bus-width = <8>;
+	non-removable;
+	cap-mmc-hw-reset;
+	status = "okay";
+};
+
+&usb_otg {
+	dr_mode = "peripheral";
+	status = "okay";
+};
+
+&usbphy {
+	status = "okay";
+};

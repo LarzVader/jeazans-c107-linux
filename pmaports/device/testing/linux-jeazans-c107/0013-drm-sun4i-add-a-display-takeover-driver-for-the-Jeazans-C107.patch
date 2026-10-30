@@ -1,0 +1,792 @@
+From: Lars <118484383+LarzVader@users.noreply.github.com>
+Subject: [PATCH] drm/sun4i: add a display takeover driver for the Jeazans C107
+
+Mainline has no driver for the A523 display pipeline yet, simpledrm can only
+copy into the buffer of the vendor boot loader with the CPU. Add a small driver
+that leaves the pipeline running as the boot loader has set it up and only
+changes the scanout address of the layer, the frame interrupt of the TCON and
+the duty cycle of the backlight PWM. That gives real page flips on CMA buffers,
+vblank, a backlight device and, through the driver name, Mesa kmsro with Panfrost.
+
+Local to this tablet, not meant for upstream: it depends on what the vendor boot
+loader leaves behind and does not know how to start the display on its own.
+
+---
+--- a/drivers/gpu/drm/sun4i/Kconfig
++++ b/drivers/gpu/drm/sun4i/Kconfig
+@@ -85,4 +85,17 @@
+ 	  TCON TOP is responsible for configuring display pipeline for
+ 	  HDMI, TVE and LCD.
+ 
++config DRM_SUN55I_TAKEOVER
++	tristate "Takeover of the A523 display pipeline left by the boot loader"
++	depends on OF
++	depends on BACKLIGHT_CLASS_DEVICE
++	select DRM_CLIENT_SELECTION
++	select DRM_GEM_DMA_HELPER
++	select DRM_KMS_HELPER
++	help
++	  Choose this option for the Jeazans C107 tablet, where mainline cannot
++	  bring up the Allwinner A523 display yet. The driver keeps the pipeline
++	  running as the vendor boot loader has left it and only adds page flips,
++	  vblank and the backlight on top.
++
+ endif
+--- a/drivers/gpu/drm/sun4i/Makefile
++++ b/drivers/gpu/drm/sun4i/Makefile
+@@ -38,3 +38,4 @@
+ obj-$(CONFIG_DRM_SUN8I_DW_HDMI)	+= sun8i-drm-hdmi.o
+ obj-$(CONFIG_DRM_SUN8I_MIXER)	+= sun8i-mixer.o
+ obj-$(CONFIG_DRM_SUN8I_TCON_TOP) += sun8i_tcon_top.o
++obj-$(CONFIG_DRM_SUN55I_TAKEOVER) += sun55i_takeover.o
+--- /dev/null
++++ b/drivers/gpu/drm/sun4i/sun55i_takeover.c
+@@ -0,0 +1,748 @@
++// SPDX-License-Identifier: GPL-2.0-or-later
++/*
++ * Display takeover for the Allwinner A523 on the Jeazans C107 tablet
++ *
++ * Mainline cannot bring up the A523 display pipeline yet (DE33 mixer, TCON-LCD,
++ * MIPI-DSI host, combo D-PHY). The vendor boot loader however leaves all of it
++ * running, with the panel lit and one UI layer enabled in the mixer. This driver
++ * leaves the TCON setup, the DSI host, the PHY, the clock rates and the panel
++ * alone and only touches what can change while that pipeline keeps running:
++ *
++ *  - the scanout address of the layer, which gives real page flips on CMA
++ *    buffers instead of the CPU copy of simpledrm (the mixer takes the new
++ *    address without RCQ or a commit),
++ *  - the frame interrupt of the TCON, which gives vblank,
++ *  - the duty cycle of the PWM channel behind the backlight.
++ *
++ * The drm_driver name is "sun4i-drm" on purpose: Mesa then uses kmsro, so that
++ * Panfrost renders straight into the buffers allocated here.
++ */
++
++#include <linux/aperture.h>
++#include <linux/backlight.h>
++#include <linux/bitfield.h>
++#include <linux/clk.h>
++#include <linux/delay.h>
++#include <linux/device.h>
++#include <linux/dma-mapping.h>
++#include <linux/gpio/consumer.h>
++#include <linux/interrupt.h>
++#include <linux/io.h>
++#include <linux/ktime.h>
++#include <linux/math64.h>
++#include <linux/minmax.h>
++#include <linux/module.h>
++#include <linux/of.h>
++#include <linux/platform_device.h>
++#include <linux/pm_domain.h>
++#include <linux/spinlock.h>
++
++#include <drm/clients/drm_client_setup.h>
++#include <drm/drm_atomic.h>
++#include <drm/drm_atomic_helper.h>
++#include <drm/drm_connector.h>
++#include <drm/drm_crtc.h>
++#include <drm/drm_drv.h>
++#include <drm/drm_encoder.h>
++#include <drm/drm_fb_dma_helper.h>
++#include <drm/drm_fbdev_dma.h>
++#include <drm/drm_fourcc.h>
++#include <drm/drm_framebuffer.h>
++#include <drm/drm_gem_atomic_helper.h>
++#include <drm/drm_gem_dma_helper.h>
++#include <drm/drm_gem_framebuffer_helper.h>
++#include <drm/drm_mode_config.h>
++#include <drm/drm_modeset_helper_vtables.h>
++#include <drm/drm_plane.h>
++#include <drm/drm_print.h>
++#include <drm/drm_probe_helper.h>
++#include <drm/drm_simple_kms_helper.h>
++#include <drm/drm_vblank.h>
++
++/* UI layer in the mixer, as sun8i_ui_layer.h. The DMA mask keeps the upper address bits at 0. */
++#define LAYER_ATTR			0x00
++#define LAYER_ATTR_EN			BIT(0)
++#define LAYER_ATTR_FORMAT		GENMASK(12, 8)
++#define LAYER_PITCH			0x0c
++#define LAYER_ADDR			0x10
++
++/* As sun8i_mixer.h */
++#define FORMAT_ARGB8888			0
++#define FORMAT_XRGB8888			4
++
++/* TCON, as sun4i_tcon.h. The flags clear when written with 0. */
++#define TCON_GINT0			0x04
++#define TCON_GINT0_TRI_FINISH_ENABLE	BIT(27)
++#define TCON_GINT0_TRI_FINISH_INT	BIT(11)
++
++/* PWM channel: entire cycle in the upper half, active cycle in the lower */
++#define PWM_PERIOD			0x04
++#define PWM_PERIOD_ENTIRE		GENMASK(31, 16)
++#define PWM_PERIOD_ACTIVE		GENMASK(15, 0)
++
++#define BACKLIGHT_MAX			100
++/* The vendor keeps 5 % as the lowest setting, below that the panel is unreadable */
++#define BACKLIGHT_MIN_PERCENT		5
++
++/* The check of the frame interrupt before taking over: about 30 are expected */
++#define CHECK_MS			500
++#define CHECK_MIN_IRQS			10
++#define CHECK_MAX_IRQS			1000
++
++static bool check_only;
++module_param(check_only, bool, 0444);
++MODULE_PARM_DESC(check_only, "Only check the frame interrupt and leave the display alone");
++
++struct sun55i_takeover {
++	struct drm_device drm;
++	struct drm_plane plane;
++	struct drm_crtc crtc;
++	struct drm_encoder encoder;
++	struct drm_connector connector;
++
++	void __iomem *layer;
++	void __iomem *tcon;
++	void __iomem *pwm;
++
++	struct backlight_device *backlight;
++	struct gpio_desc *backlight_enable;
++	u32 pwm_entire;
++
++	int pd_count;
++	struct device **pd_devs;
++	struct device_link **pd_links;
++
++	/* Serializes the read-modify-write of TCON_GINT0 */
++	spinlock_t tcon_lock;
++
++	/* Protected by drm.event_lock */
++	bool flip_pending;
++	dma_addr_t next_addr;
++	u32 next_pitch;
++	u32 next_format;
++
++	bool checking;
++	unsigned int check_irqs;
++	ktime_t check_first;
++	ktime_t check_last;
++
++	/* What the boot loader left, the memory behind it stays reserved */
++	u32 boot_attr;
++	u32 boot_pitch;
++	u32 boot_addr;
++};
++
++/* The panel as described in the vendor device tree */
++static const struct drm_display_mode sun55i_takeover_mode = {
++	.clock = 68000,
++	.hdisplay = 800,
++	.hsync_start = 800 + 20,
++	.hsync_end = 800 + 20 + 20,
++	.htotal = 860,
++	.vdisplay = 1280,
++	.vsync_start = 1280 + 30,
++	.vsync_end = 1280 + 30 + 4,
++	.vtotal = 1322,
++	.width_mm = 137,
++	.height_mm = 217,
++	.type = DRM_MODE_TYPE_DRIVER | DRM_MODE_TYPE_PREFERRED,
++};
++
++static struct sun55i_takeover *to_takeover(struct drm_device *drm)
++{
++	return container_of(drm, struct sun55i_takeover, drm);
++}
++
++/* Layer */
++
++static void sun55i_takeover_layer_apply(struct sun55i_takeover *st)
++{
++	u32 attr = readl(st->layer + LAYER_ATTR);
++
++	attr &= ~LAYER_ATTR_FORMAT;
++	attr |= FIELD_PREP(LAYER_ATTR_FORMAT, st->next_format) | LAYER_ATTR_EN;
++
++	writel(st->next_pitch, st->layer + LAYER_PITCH);
++	writel(lower_32_bits(st->next_addr), st->layer + LAYER_ADDR);
++	writel(attr, st->layer + LAYER_ATTR);
++}
++
++static const u32 sun55i_takeover_formats[] = {
++	DRM_FORMAT_XRGB8888,
++	DRM_FORMAT_ARGB8888,
++};
++
++static const u64 sun55i_takeover_modifiers[] = {
++	DRM_FORMAT_MOD_LINEAR,
++	DRM_FORMAT_MOD_INVALID,
++};
++
++static int sun55i_takeover_plane_atomic_check(struct drm_plane *plane,
++					      struct drm_atomic_commit *state)
++{
++	struct drm_plane_state *new = drm_atomic_get_new_plane_state(state, plane);
++	struct drm_crtc_state *crtc_state = NULL;
++
++	if (new->crtc)
++		crtc_state = drm_atomic_get_new_crtc_state(state, new->crtc);
++
++	return drm_atomic_helper_check_plane_state(new, crtc_state,
++						   DRM_PLANE_NO_SCALING,
++						   DRM_PLANE_NO_SCALING,
++						   false, true);
++}
++
++static void sun55i_takeover_plane_atomic_update(struct drm_plane *plane,
++						struct drm_atomic_commit *state)
++{
++	struct sun55i_takeover *st = to_takeover(plane->dev);
++	struct drm_plane_state *new = drm_atomic_get_new_plane_state(state, plane);
++	struct drm_framebuffer *fb = new->fb;
++	unsigned long flags;
++
++	spin_lock_irqsave(&st->drm.event_lock, flags);
++	st->next_addr = drm_fb_dma_get_gem_addr(fb, new, 0);
++	st->next_pitch = fb->pitches[0];
++	st->next_format = fb->format->format == DRM_FORMAT_ARGB8888 ?
++			  FORMAT_ARGB8888 : FORMAT_XRGB8888;
++	spin_unlock_irqrestore(&st->drm.event_lock, flags);
++}
++
++/*
++ * The mixer must stop reading the buffer before it is freed, so this cannot wait
++ * for the next frame. The blender then shows its black fill color.
++ */
++static void sun55i_takeover_plane_atomic_disable(struct drm_plane *plane,
++						 struct drm_atomic_commit *state)
++{
++	struct sun55i_takeover *st = to_takeover(plane->dev);
++	unsigned long flags;
++
++	spin_lock_irqsave(&st->drm.event_lock, flags);
++	st->flip_pending = false;
++	writel(readl(st->layer + LAYER_ATTR) & ~LAYER_ATTR_EN,
++	       st->layer + LAYER_ATTR);
++	spin_unlock_irqrestore(&st->drm.event_lock, flags);
++}
++
++static const struct drm_plane_helper_funcs sun55i_takeover_plane_helper_funcs = {
++	.atomic_check = sun55i_takeover_plane_atomic_check,
++	.atomic_update = sun55i_takeover_plane_atomic_update,
++	.atomic_disable = sun55i_takeover_plane_atomic_disable,
++};
++
++static const struct drm_plane_funcs sun55i_takeover_plane_funcs = {
++	.update_plane = drm_atomic_helper_update_plane,
++	.disable_plane = drm_atomic_helper_disable_plane,
++	.destroy = drm_plane_cleanup,
++	.reset = drm_atomic_helper_plane_reset,
++	.atomic_duplicate_state = drm_atomic_helper_plane_duplicate_state,
++	.atomic_destroy_state = drm_atomic_helper_plane_destroy_state,
++};
++
++/* CRTC: the TCON runs on its own, only its interrupt is switched */
++
++static void sun55i_takeover_tcon_irq(struct sun55i_takeover *st, bool enable)
++{
++	unsigned long flags;
++	u32 val;
++
++	spin_lock_irqsave(&st->tcon_lock, flags);
++	val = readl(st->tcon + TCON_GINT0);
++	if (enable)
++		val = (val | TCON_GINT0_TRI_FINISH_ENABLE) & ~TCON_GINT0_TRI_FINISH_INT;
++	else
++		val &= ~TCON_GINT0_TRI_FINISH_ENABLE;
++	writel(val, st->tcon + TCON_GINT0);
++	spin_unlock_irqrestore(&st->tcon_lock, flags);
++}
++
++static irqreturn_t sun55i_takeover_irq(int irq, void *data)
++{
++	struct sun55i_takeover *st = data;
++	u32 val;
++
++	spin_lock(&st->tcon_lock);
++	val = readl(st->tcon + TCON_GINT0);
++	if (!(val & TCON_GINT0_TRI_FINISH_INT)) {
++		spin_unlock(&st->tcon_lock);
++		return IRQ_NONE;
++	}
++	val &= ~TCON_GINT0_TRI_FINISH_INT;
++	/* Should the flag not clear after all, the check must not hang in here */
++	if (st->checking && st->check_irqs >= CHECK_MAX_IRQS)
++		val &= ~TCON_GINT0_TRI_FINISH_ENABLE;
++	writel(val, st->tcon + TCON_GINT0);
++	spin_unlock(&st->tcon_lock);
++
++	if (st->checking) {
++		st->check_last = ktime_get();
++		if (!st->check_irqs++)
++			st->check_first = st->check_last;
++		return IRQ_HANDLED;
++	}
++
++	/*
++	 * The frame has just gone out, so a new address here cannot tear. It goes
++	 * in before the vblank event does: when user space hears of the flip, the
++	 * mixer no longer reads the old buffer.
++	 */
++	spin_lock(&st->drm.event_lock);
++	if (st->flip_pending) {
++		sun55i_takeover_layer_apply(st);
++		st->flip_pending = false;
++	}
++	spin_unlock(&st->drm.event_lock);
++
++	drm_crtc_handle_vblank(&st->crtc);
++
++	return IRQ_HANDLED;
++}
++
++/*
++ * Nothing has been changed so far. Without frame interrupts no flip would ever
++ * complete, so this finds out while simpledrm still holds the picture.
++ */
++static int sun55i_takeover_check_irq(struct sun55i_takeover *st, int irq)
++{
++	struct device *dev = st->drm.dev;
++	s64 total_us;
++
++	st->checking = true;
++	sun55i_takeover_tcon_irq(st, true);
++	msleep(CHECK_MS);
++	sun55i_takeover_tcon_irq(st, false);
++	synchronize_irq(irq);
++	st->checking = false;
++
++	if (st->check_irqs < CHECK_MIN_IRQS || st->check_irqs >= CHECK_MAX_IRQS)
++		return dev_err_probe(dev, -ENODEV,
++				     "%u frame interrupts in %u ms, TCON_GINT0 %08x\n",
++				     st->check_irqs, CHECK_MS,
++				     readl(st->tcon + TCON_GINT0));
++
++	total_us = ktime_us_delta(st->check_last, st->check_first);
++	dev_info(dev, "%u frame interrupts, one every %lld us\n", st->check_irqs,
++		 div_s64(total_us, st->check_irqs - 1));
++
++	return 0;
++}
++
++static int sun55i_takeover_enable_vblank(struct drm_crtc *crtc)
++{
++	sun55i_takeover_tcon_irq(to_takeover(crtc->dev), true);
++	return 0;
++}
++
++static void sun55i_takeover_disable_vblank(struct drm_crtc *crtc)
++{
++	sun55i_takeover_tcon_irq(to_takeover(crtc->dev), false);
++}
++
++static int sun55i_takeover_crtc_atomic_check(struct drm_crtc *crtc,
++					     struct drm_atomic_commit *state)
++{
++	struct drm_crtc_state *new = drm_atomic_get_new_crtc_state(state, crtc);
++
++	if (!new->enable)
++		return 0;
++
++	return drm_atomic_helper_check_crtc_primary_plane(new);
++}
++
++static void sun55i_takeover_crtc_atomic_enable(struct drm_crtc *crtc,
++					       struct drm_atomic_commit *state)
++{
++	struct sun55i_takeover *st = to_takeover(crtc->dev);
++
++	drm_crtc_vblank_on(crtc);
++	backlight_enable(st->backlight);
++}
++
++static void sun55i_takeover_crtc_atomic_disable(struct drm_crtc *crtc,
++						struct drm_atomic_commit *state)
++{
++	struct sun55i_takeover *st = to_takeover(crtc->dev);
++
++	backlight_disable(st->backlight);
++	drm_crtc_vblank_off(crtc);
++
++	spin_lock_irq(&crtc->dev->event_lock);
++	if (crtc->state->event && !crtc->state->active) {
++		drm_crtc_send_vblank_event(crtc, crtc->state->event);
++		crtc->state->event = NULL;
++	}
++	spin_unlock_irq(&crtc->dev->event_lock);
++}
++
++static void sun55i_takeover_crtc_atomic_flush(struct drm_crtc *crtc,
++					      struct drm_atomic_commit *state)
++{
++	struct sun55i_takeover *st = to_takeover(crtc->dev);
++	struct drm_pending_vblank_event *event = crtc->state->event;
++	bool plane_on = crtc->state->plane_mask & drm_plane_mask(&st->plane);
++
++	crtc->state->event = NULL;
++
++	spin_lock_irq(&crtc->dev->event_lock);
++	if (event && crtc->state->active && !drm_crtc_vblank_get(crtc)) {
++		st->flip_pending = plane_on;
++		drm_crtc_arm_vblank_event(crtc, event);
++	} else {
++		/* No frame interrupt to wait for */
++		if (plane_on)
++			sun55i_takeover_layer_apply(st);
++		if (event)
++			drm_crtc_send_vblank_event(crtc, event);
++	}
++	spin_unlock_irq(&crtc->dev->event_lock);
++}
++
++static const struct drm_crtc_helper_funcs sun55i_takeover_crtc_helper_funcs = {
++	.atomic_check = sun55i_takeover_crtc_atomic_check,
++	.atomic_enable = sun55i_takeover_crtc_atomic_enable,
++	.atomic_disable = sun55i_takeover_crtc_atomic_disable,
++	.atomic_flush = sun55i_takeover_crtc_atomic_flush,
++};
++
++static const struct drm_crtc_funcs sun55i_takeover_crtc_funcs = {
++	.reset = drm_atomic_helper_crtc_reset,
++	.destroy = drm_crtc_cleanup,
++	.set_config = drm_atomic_helper_set_config,
++	.page_flip = drm_atomic_helper_page_flip,
++	.atomic_duplicate_state = drm_atomic_helper_crtc_duplicate_state,
++	.atomic_destroy_state = drm_atomic_helper_crtc_destroy_state,
++	.enable_vblank = sun55i_takeover_enable_vblank,
++	.disable_vblank = sun55i_takeover_disable_vblank,
++};
++
++/* Connector */
++
++static int sun55i_takeover_get_modes(struct drm_connector *connector)
++{
++	return drm_connector_helper_get_modes_fixed(connector, &sun55i_takeover_mode);
++}
++
++static const struct drm_connector_helper_funcs sun55i_takeover_connector_helper_funcs = {
++	.get_modes = sun55i_takeover_get_modes,
++};
++
++static const struct drm_connector_funcs sun55i_takeover_connector_funcs = {
++	.reset = drm_atomic_helper_connector_reset,
++	.fill_modes = drm_helper_probe_single_connector_modes,
++	.destroy = drm_connector_cleanup,
++	.atomic_duplicate_state = drm_atomic_helper_connector_duplicate_state,
++	.atomic_destroy_state = drm_atomic_helper_connector_destroy_state,
++};
++
++/* Backlight */
++
++static int sun55i_takeover_backlight_update(struct backlight_device *bl)
++{
++	struct sun55i_takeover *st = bl_get_data(bl);
++	int brightness = backlight_get_brightness(bl);
++	u32 active = 0;
++
++	/* 0 has to mean dark: the emergency stop writes it to every backlight */
++	if (brightness)
++		active = DIV_ROUND_UP(st->pwm_entire * max(brightness, BACKLIGHT_MIN_PERCENT),
++				      BACKLIGHT_MAX);
++
++	writel(FIELD_PREP(PWM_PERIOD_ENTIRE, st->pwm_entire) |
++	       FIELD_PREP(PWM_PERIOD_ACTIVE, active), st->pwm + PWM_PERIOD);
++	gpiod_set_value_cansleep(st->backlight_enable, active != 0);
++
++	return 0;
++}
++
++static const struct backlight_ops sun55i_takeover_backlight_ops = {
++	.options = BL_CORE_SUSPENDRESUME,
++	.update_status = sun55i_takeover_backlight_update,
++};
++
++static int sun55i_takeover_backlight_init(struct sun55i_takeover *st)
++{
++	struct device *dev = st->drm.dev;
++	struct backlight_properties props = {
++		.type = BACKLIGHT_RAW,
++		.max_brightness = BACKLIGHT_MAX,
++		.scale = BACKLIGHT_SCALE_LINEAR,
++	};
++	u32 val = readl(st->pwm + PWM_PERIOD);
++
++	st->pwm_entire = FIELD_GET(PWM_PERIOD_ENTIRE, val);
++	if (!st->pwm_entire)
++		return dev_err_probe(dev, -EINVAL, "backlight PWM is not running\n");
++
++	/* Start with what the boot loader has set */
++	props.brightness = FIELD_GET(PWM_PERIOD_ACTIVE, val) * BACKLIGHT_MAX /
++			   st->pwm_entire;
++
++	st->backlight_enable = devm_gpiod_get_optional(dev, "backlight-enable",
++						       GPIOD_OUT_HIGH);
++	if (IS_ERR(st->backlight_enable))
++		return PTR_ERR(st->backlight_enable);
++
++	st->backlight = devm_backlight_device_register(dev, "panel", dev, st,
++						       &sun55i_takeover_backlight_ops,
++						       &props);
++	return PTR_ERR_OR_ZERO(st->backlight);
++}
++
++/* Power domains, as simpledrm: with more than one the driver core does not attach */
++
++static void sun55i_takeover_detach_genpd(void *data)
++{
++	struct sun55i_takeover *st = data;
++	int i;
++
++	for (i = st->pd_count - 1; i >= 0; i--) {
++		if (st->pd_links[i])
++			device_link_del(st->pd_links[i]);
++		if (!IS_ERR_OR_NULL(st->pd_devs[i]))
++			dev_pm_domain_detach(st->pd_devs[i], true);
++	}
++}
++
++static int sun55i_takeover_attach_genpd(struct sun55i_takeover *st)
++{
++	struct device *dev = st->drm.dev;
++	int i, count;
++
++	count = of_count_phandle_with_args(dev->of_node, "power-domains",
++					   "#power-domain-cells");
++	if (count <= 1)
++		return 0;
++
++	st->pd_devs = devm_kcalloc(dev, count, sizeof(*st->pd_devs), GFP_KERNEL);
++	st->pd_links = devm_kcalloc(dev, count, sizeof(*st->pd_links), GFP_KERNEL);
++	if (!st->pd_devs || !st->pd_links)
++		return -ENOMEM;
++
++	st->pd_count = count;
++	for (i = 0; i < count; i++) {
++		st->pd_devs[i] = dev_pm_domain_attach_by_id(dev, i);
++		if (IS_ERR(st->pd_devs[i])) {
++			int ret = PTR_ERR(st->pd_devs[i]);
++
++			sun55i_takeover_detach_genpd(st);
++			return dev_err_probe(dev, ret, "cannot attach power domain %d\n", i);
++		}
++		st->pd_links[i] = device_link_add(dev, st->pd_devs[i],
++						  DL_FLAG_STATELESS |
++						  DL_FLAG_PM_RUNTIME |
++						  DL_FLAG_RPM_ACTIVE);
++		if (!st->pd_links[i]) {
++			sun55i_takeover_detach_genpd(st);
++			return -EINVAL;
++		}
++	}
++
++	return devm_add_action_or_reset(dev, sun55i_takeover_detach_genpd, st);
++}
++
++/* Driver */
++
++static const struct drm_mode_config_funcs sun55i_takeover_mode_config_funcs = {
++	.fb_create = drm_gem_fb_create,
++	.atomic_check = drm_atomic_helper_check,
++	.atomic_commit = drm_atomic_helper_commit,
++};
++
++DEFINE_DRM_GEM_DMA_FOPS(sun55i_takeover_fops);
++
++static const struct drm_driver sun55i_takeover_driver = {
++	.driver_features = DRIVER_GEM | DRIVER_MODESET | DRIVER_ATOMIC,
++	.fops = &sun55i_takeover_fops,
++	.name = "sun4i-drm",
++	.desc = "Allwinner A523 display takeover",
++	.major = 1,
++	.minor = 0,
++	DRM_GEM_DMA_DRIVER_OPS,
++	DRM_FBDEV_DMA_DRIVER_OPS,
++};
++
++static int sun55i_takeover_kms_init(struct sun55i_takeover *st)
++{
++	struct drm_device *drm = &st->drm;
++	int ret;
++
++	ret = drmm_mode_config_init(drm);
++	if (ret)
++		return ret;
++
++	drm->mode_config.funcs = &sun55i_takeover_mode_config_funcs;
++	drm->mode_config.min_width = sun55i_takeover_mode.hdisplay;
++	drm->mode_config.max_width = sun55i_takeover_mode.hdisplay;
++	drm->mode_config.min_height = sun55i_takeover_mode.vdisplay;
++	drm->mode_config.max_height = sun55i_takeover_mode.vdisplay;
++	drm->mode_config.preferred_depth = 24;
++
++	ret = drm_universal_plane_init(drm, &st->plane, BIT(0),
++				       &sun55i_takeover_plane_funcs,
++				       sun55i_takeover_formats,
++				       ARRAY_SIZE(sun55i_takeover_formats),
++				       sun55i_takeover_modifiers,
++				       DRM_PLANE_TYPE_PRIMARY, NULL);
++	if (ret)
++		return ret;
++	drm_plane_helper_add(&st->plane, &sun55i_takeover_plane_helper_funcs);
++
++	ret = drm_crtc_init_with_planes(drm, &st->crtc, &st->plane, NULL,
++					&sun55i_takeover_crtc_funcs, NULL);
++	if (ret)
++		return ret;
++	drm_crtc_helper_add(&st->crtc, &sun55i_takeover_crtc_helper_funcs);
++
++	ret = drm_simple_encoder_init(drm, &st->encoder, DRM_MODE_ENCODER_DSI);
++	if (ret)
++		return ret;
++	st->encoder.possible_crtcs = drm_crtc_mask(&st->crtc);
++
++	ret = drm_connector_init(drm, &st->connector, &sun55i_takeover_connector_funcs,
++				 DRM_MODE_CONNECTOR_DSI);
++	if (ret)
++		return ret;
++	drm_connector_helper_add(&st->connector, &sun55i_takeover_connector_helper_funcs);
++
++	ret = drm_connector_attach_encoder(&st->connector, &st->encoder);
++	if (ret)
++		return ret;
++
++	ret = drm_vblank_init(drm, 1);
++	if (ret)
++		return ret;
++
++	drm_mode_config_reset(drm);
++
++	return 0;
++}
++
++static int sun55i_takeover_probe(struct platform_device *pdev)
++{
++	struct device *dev = &pdev->dev;
++	struct sun55i_takeover *st;
++	struct clk_bulk_data *clks;
++	int irq, ret;
++
++	st = devm_drm_dev_alloc(dev, &sun55i_takeover_driver,
++				struct sun55i_takeover, drm);
++	if (IS_ERR(st))
++		return PTR_ERR(st);
++	platform_set_drvdata(pdev, st);
++	spin_lock_init(&st->tcon_lock);
++
++	st->layer = devm_platform_ioremap_resource_byname(pdev, "layer");
++	if (IS_ERR(st->layer))
++		return PTR_ERR(st->layer);
++	st->tcon = devm_platform_ioremap_resource_byname(pdev, "tcon");
++	if (IS_ERR(st->tcon))
++		return PTR_ERR(st->tcon);
++	st->pwm = devm_platform_ioremap_resource_byname(pdev, "pwm");
++	if (IS_ERR(st->pwm))
++		return PTR_ERR(st->pwm);
++
++	irq = platform_get_irq(pdev, 0);
++	if (irq < 0)
++		return irq;
++
++	ret = dma_set_mask_and_coherent(dev, DMA_BIT_MASK(32));
++	if (ret)
++		return ret;
++
++	/*
++	 * Hold everything the pipeline runs on before simpledrm lets go of it,
++	 * or these clocks and domains would be switched off under the panel.
++	 */
++	ret = devm_clk_bulk_get_all_enabled(dev, &clks);
++	if (ret < 0)
++		return dev_err_probe(dev, ret, "cannot enable clocks\n");
++	ret = sun55i_takeover_attach_genpd(st);
++	if (ret)
++		return ret;
++
++	st->boot_attr = readl(st->layer + LAYER_ATTR);
++	st->boot_pitch = readl(st->layer + LAYER_PITCH);
++	st->boot_addr = readl(st->layer + LAYER_ADDR);
++	dev_info(dev, "boot loader left layer %08x, pitch %u, address %08x, TCON_GINT0 %08x, PWM %08x\n",
++		 st->boot_attr, st->boot_pitch, st->boot_addr,
++		 readl(st->tcon + TCON_GINT0), readl(st->pwm + PWM_PERIOD));
++	if (!(st->boot_attr & LAYER_ATTR_EN))
++		return dev_err_probe(dev, -ENODEV, "boot loader left the layer off\n");
++
++	ret = sun55i_takeover_kms_init(st);
++	if (ret)
++		return ret;
++
++	ret = devm_request_irq(dev, irq, sun55i_takeover_irq, 0, dev_name(dev), st);
++	if (ret)
++		return ret;
++
++	ret = sun55i_takeover_check_irq(st, irq);
++	if (ret)
++		return ret;
++
++	if (check_only) {
++		dev_info(dev, "check_only: leaving the display alone\n");
++		return -ENODEV;
++	}
++
++	ret = sun55i_takeover_backlight_init(st);
++	if (ret)
++		return ret;
++
++	ret = aperture_remove_all_conflicting_devices(sun55i_takeover_driver.name);
++	if (ret)
++		return ret;
++
++	ret = drm_dev_register(&st->drm, 0);
++	if (ret)
++		return ret;
++
++	drm_client_setup(&st->drm, NULL);
++
++	return 0;
++}
++
++static void sun55i_takeover_remove(struct platform_device *pdev)
++{
++	struct sun55i_takeover *st = platform_get_drvdata(pdev);
++
++	drm_dev_unregister(&st->drm);
++	drm_atomic_helper_shutdown(&st->drm);
++
++	/* Back to the reserved boot loader buffer, the CMA ones go away now */
++	writel(st->boot_pitch, st->layer + LAYER_PITCH);
++	writel(st->boot_addr, st->layer + LAYER_ADDR);
++	writel(st->boot_attr, st->layer + LAYER_ATTR);
++}
++
++static void sun55i_takeover_shutdown(struct platform_device *pdev)
++{
++	struct sun55i_takeover *st = platform_get_drvdata(pdev);
++
++	drm_atomic_helper_shutdown(&st->drm);
++}
++
++/*
++ * No MODULE_DEVICE_TABLE: the device package loads this through modules-load.d, so that
++ * it is done before the desktop starts. KWin does not move over from simpledrm later.
++ */
++static const struct of_device_id sun55i_takeover_of_table[] = {
++	{ .compatible = "jeazans,c107-display-takeover" },
++	{ }
++};
++
++static struct platform_driver sun55i_takeover_platform_driver = {
++	.probe = sun55i_takeover_probe,
++	.remove = sun55i_takeover_remove,
++	.shutdown = sun55i_takeover_shutdown,
++	.driver = {
++		.name = "sun55i-takeover",
++		.of_match_table = sun55i_takeover_of_table,
++	},
++};
++module_platform_driver(sun55i_takeover_platform_driver);
++
++MODULE_DESCRIPTION("Takes over the A523 display pipeline left running by the boot loader");
++MODULE_LICENSE("GPL");

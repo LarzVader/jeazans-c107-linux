@@ -1,0 +1,35 @@
+sunxi: A523: GICv3 in U-Boot initialisieren, solange kein TF-A (BL31) laeuft
+
+Ohne BL31 bleibt U-Boot in EL3 und muss den Interrupt-Controller selbst fuer
+die nicht-sichere Welt freischalten (Gruppen, ICC_SRE_EL3.Enable). Sonst sieht
+Linux in EL2 keine Interrupts und haengt beim Setzen von ICC_SRE_EL2.
+Adressen laut sun55i-a523.dtsi: GICD 0x3400000, GICR 0x3460000.
+
+diff --git a/arch/arm/mach-sunxi/Kconfig b/arch/arm/mach-sunxi/Kconfig
+--- a/arch/arm/mach-sunxi/Kconfig
++++ b/arch/arm/mach-sunxi/Kconfig
+@@ -560,6 +560,7 @@ config MACH_SUN55I_A523
+ 	bool "sun55i (Allwinner A523/A527/T527/H728)"
+ 	select ARM64
+ 	select SUNXI_GEN_NCAT2
++	select GICV3
+ 	select SUNXI_NEW_PINCTRL
+ 	select DRAM_SUN55I_A523
+ 	select FIT
+diff --git a/include/configs/sunxi-common.h b/include/configs/sunxi-common.h
+--- a/include/configs/sunxi-common.h
++++ b/include/configs/sunxi-common.h
+@@ -57,6 +57,12 @@
+ #define CFG_SYS_INIT_RAM_ADDR	CONFIG_SUNXI_SRAM_ADDRESS
+ /* FIXME: this may be larger on some SoCs */
+ #define CFG_SYS_INIT_RAM_SIZE	0x8000 /* 32 KiB */
+
++#ifdef CONFIG_MACH_SUN55I_A523
++/* GICv3 des A523; U-Boot initialisiert ihn selbst, solange kein BL31 laeuft */
++#define GICD_BASE		0x3400000
++#define GICR_BASE		0x3460000
++#endif
++
+ #define PHYS_SDRAM_0			CFG_SYS_SDRAM_BASE
+ #define PHYS_SDRAM_0_SIZE		0x80000000 /* 2 GiB */
+

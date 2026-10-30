@@ -1,0 +1,15 @@
+# Build output, images and logs never belong here
+*.img
+*.bin
+*.fw
+*.log
+*.log.txt
+*.status
+build*/
+fastboot/
+dtb-bau/
+konsole-logs/
+__pycache__/
+# Signing keys stay private
+toc0-keys/
+*.pem

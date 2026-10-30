@@ -1,0 +1,13 @@
+diff --git a/drivers/usb/gadget/f_mass_storage.c b/drivers/usb/gadget/f_mass_storage.c
+index 76ee08dc..bc6be84f 100644
+--- a/drivers/usb/gadget/f_mass_storage.c
++++ b/drivers/usb/gadget/f_mass_storage.c
+@@ -2501,6 +2501,8 @@ static struct fsg_common *fsg_common_init(struct fsg_common *common,
+ 	for (i = 0; i < nluns; i++) {
+ 		common->luns[i].removable = 1;
+ 
++		/* Jeazans C107: standardmaessig schreibgeschuetzt, schreiben nur mit "setenv ums_rw 1" */
++		common->luns[i].initially_ro = env_get_yesno("ums_rw") != 1;
+ 		rc = fsg_lun_open(&common->luns[i], ums[i].num_sectors, ums->block_dev.blksz, "");
+ 		if (rc)
+ 			goto error_luns;

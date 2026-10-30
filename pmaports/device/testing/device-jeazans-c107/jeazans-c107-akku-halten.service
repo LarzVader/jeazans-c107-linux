@@ -1,0 +1,9 @@
+[Unit]
+Description=Akku im Dauerbetrieb bei rund 3,8 V halten
+
+[Service]
+ExecStart=/usr/libexec/jeazans-c107-akku-halten
+# Danach gilt wieder nur die Ladegrenze aus dem Geraetebaum (4,0 V)
+ExecStopPost=/bin/sh -c 'echo Charging > /sys/class/power_supply/axp20x-battery/status'
+Restart=on-failure
+RestartSec=30

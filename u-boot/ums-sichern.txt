@@ -1,0 +1,4 @@
+echo "== Jeazans C107: eMMC wird schreibgeschuetzt per USB freigegeben =="
+mmc dev 0
+mmc info
+ums 0 mmc 0

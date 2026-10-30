@@ -1,0 +1,32 @@
+From: Lars <118484383+LarzVader@users.noreply.github.com>
+Subject: [PATCH] wifi: aic: ignore a scan confirm after the scan was aborted
+
+rwnx_close() aborts a running scan: it reports it to cfg80211, drops the
+scan activity reference and clears scan_request, then cancels the scan in
+the firmware. The firmware still sends SCANU_START_CFM afterwards, and
+without CONFIG_AIC8800_SCHED_SCAN the handler calls cfg80211_scan_done()
+unconditionally, i.e. with NULL. That oopses in the RX thread (seen when
+NetworkManager bounces the interface to change the MAC address) and the
+device stops working. Return early when no scan is pending.
+
+---
+--- a/drivers/net/wireless/aic/aic8800_fdrv/rwnx_msg_rx.c
++++ b/drivers/net/wireless/aic/aic8800_fdrv/rwnx_msg_rx.c
+@@ -686,6 +686,17 @@
+ 
+ 	RWNX_DBG(RWNX_FN_ENTRY_STR);
+ 
++	/*
++	 * The confirm can arrive after the scan was finished elsewhere, e.g.
++	 * aborted in rwnx_close() (scan_request cleared, scan activity
++	 * released there). Reporting it again would pass NULL to
++	 * cfg80211_scan_done() and drop the activity reference twice.
++	 */
++	if (!rwnx_hw->scan_request) {
++		rwnx_hw->scanning = 0;
++		return 0;
++	}
++
+ #ifdef CONFIG_AIC8800_SCHED_SCAN
+ 	if (rwnx_hw->scan_request && !rwnx_hw->is_sched_scan)
+ #endif // CONFIG_AIC8800_SCHED_SCAN
