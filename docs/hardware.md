@@ -62,8 +62,9 @@ Rails used by Linux (voltages from the vendor tree):
 Battery: 4990 mAh, vendor charge voltage 4.35 V, charge current 768 mA,
 termination 128 mA, input limit 2000 mA, temperature sensor active. The device
 tree limits the charge voltage to 4.0 V and the `jeazans-c107-akku-halten`
-service stops charging at about 3.9 V and resumes below 3.75 V, so the battery
-rests near 3.85 V at about 50 % while the tablet runs on the charger.
+service stops charging at 50 % and resumes below 45 % (fuel gauge reading), so the
+battery rests near 3.83 V while the tablet runs on the charger. A voltage threshold
+does not work here: stopping at 3.9 V while charging from empty left it at 34 %.
 
 AXP717 driver observations (7.2.11, candidates for fixes):
 

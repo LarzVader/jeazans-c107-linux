@@ -1,5 +1,5 @@
 [Unit]
-Description=Akku im Dauerbetrieb bei rund 3,8 V halten
+Description=Akku im Dauerbetrieb bei rund 50 % halten
 
 [Service]
 ExecStart=/usr/libexec/jeazans-c107-akku-halten

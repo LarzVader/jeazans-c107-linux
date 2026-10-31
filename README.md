@@ -25,7 +25,7 @@ the tools. It is **not** a turnkey installer.
 | GPU | works | Mali-G57 with Panfrost, KWin/Plasma Mobile use it |
 | Touch | works | Silead GSL3676, firmware from the Android image, retry on warm boot (patch 0010) |
 | Sound | works | Internal A523 codec: speakers, headphones, jack detection and automatic switching. Microphones untested |
-| Battery, charger | works | AXP717: capacity, voltage, charge control, USB input. A small service keeps the battery near 3.8 V for 24/7 operation on the charger |
+| Battery, charger | works | AXP717: capacity, voltage, charge control, USB input. A small service keeps the battery near 50 % for 24/7 operation on the charger |
 | Power key, volume keys | works | AXP717 PEK and the LRADC |
 | Accelerometer | works | SC7A20 on I2C1, KWin rotates the screen |
 | USB gadget network | works | RNDIS (NCM stalled under load) |
